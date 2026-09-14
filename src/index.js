@@ -1,7 +1,7 @@
 // Google Docs MCP Server — Zero dependencies
 // OAuth 2.0 with auto-refresh, tokens stored in Cloudflare KV
 
-const SERVER_INFO = { name: "google-docs-api", version: "1.1.0" };
+const SERVER_INFO = { name: "google-docs-api", version: "1.2.0" };
 const PROTOCOL_VERSION = "2024-11-05";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -98,7 +98,7 @@ const TOOLS = [
   },
   {
     name: "doc_create_with_flowchart",
-    description: "Create a new Google Doc with a Mermaid flowchart image inserted between contentBefore and contentAfter. Use for NDIB proposal docs that need a process diagram. Renders the Mermaid source as an image via mermaid.ink and inserts it inline. Auto-shares.",
+    description: "Create a new Google Doc with a Mermaid flowchart image and auto-bolded headings. Inserts contentBefore, then the flowchart image rendered via mermaid.ink, then contentAfter. After insertion, auto-bolds any paragraph starting with 'Exactly How I Will', or matching 'What you'll get' or 'Timeline'. Use for NDIB proposal docs. Auto-shares.",
     inputSchema: {
       type: "object",
       properties: {
@@ -243,6 +243,31 @@ async function handleTool(env, name, args) {
         });
       }
 
+      const finalDoc = await callDocs(env, "GET", `/documents/${docId}`);
+      if (!finalDoc._error && finalDoc.body?.content) {
+        const boldRequests = [];
+        for (const el of finalDoc.body.content) {
+          if (!el.paragraph?.elements) continue;
+          let paraText = "";
+          for (const e of el.paragraph.elements) {
+            if (e.textRun?.content) paraText += e.textRun.content;
+          }
+          const trimmed = paraText.trim();
+          if (trimmed.startsWith("Exactly How I Will") || trimmed === "What you'll get" || trimmed === "Timeline") {
+            boldRequests.push({
+              updateTextStyle: {
+                range: { startIndex: el.startIndex, endIndex: el.endIndex - 1 },
+                textStyle: { bold: true },
+                fields: "bold",
+              },
+            });
+          }
+        }
+        if (boldRequests.length > 0) {
+          await callDocs(env, "POST", `/documents/${docId}:batchUpdate`, { requests: boldRequests });
+        }
+      }
+
       if (a.folderId) {
         await callDrive(env, "PATCH", `/files/${docId}?addParents=${a.folderId}&fields=id`, {});
       }
@@ -260,6 +285,7 @@ async function handleTool(env, name, args) {
         viewUrl: `https://docs.google.com/document/d/${docId}`,
         shared: true,
         diagramInserted,
+        boldHeadings: true,
       });
     }
 
