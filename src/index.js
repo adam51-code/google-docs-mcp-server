@@ -1,7 +1,7 @@
 // Google Docs MCP Server — Zero dependencies
 // OAuth 2.0 with auto-refresh, tokens stored in Cloudflare KV
 
-const SERVER_INFO = { name: "google-docs-api", version: "1.0.0" };
+const SERVER_INFO = { name: "google-docs-api", version: "1.1.0" };
 const PROTOCOL_VERSION = "2024-11-05";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -77,6 +77,11 @@ function toolResult(data) {
   return { content: [{ type: "text", text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }] };
 }
 
+function buildMermaidUrl(mermaidSource) {
+  const encoded = btoa(unescape(encodeURIComponent(mermaidSource)));
+  return `https://mermaid.ink/img/${encoded}`;
+}
+
 const TOOLS = [
   {
     name: "doc_create",
@@ -89,6 +94,21 @@ const TOOLS = [
         folderId: { type: "string", description: "Optional Google Drive folder ID to place the doc in" },
       },
       required: ["title", "content"],
+    },
+  },
+  {
+    name: "doc_create_with_flowchart",
+    description: "Create a new Google Doc with a Mermaid flowchart image inserted between contentBefore and contentAfter. Use for NDIB proposal docs that need a process diagram. Renders the Mermaid source as an image via mermaid.ink and inserts it inline. Auto-shares.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Document title" },
+        contentBefore: { type: "string", description: "Text content BEFORE the flowchart (everything up to and including the Exactly How I Will header line)" },
+        mermaidSource: { type: "string", description: "Mermaid graph TD source. Example: graph TD\\n    A[Set conversion objective] --> B[Write no contract creative]\\n    B --> C[Split by trade angle]" },
+        contentAfter: { type: "string", description: "Text content AFTER the flowchart (numbered steps, What you'll get, Timeline)" },
+        folderId: { type: "string", description: "Optional Google Drive folder ID" },
+      },
+      required: ["title", "contentBefore", "mermaidSource", "contentAfter"],
     },
   },
   {
@@ -124,6 +144,19 @@ const TOOLS = [
         content: { type: "string", description: "New content to replace the entire body" },
       },
       required: ["documentId", "content"],
+    },
+  },
+  {
+    name: "doc_insert_image",
+    description: "Insert an image into an existing Google Doc at a specific character index. Works with any publicly accessible image URL including mermaid.ink.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        documentId: { type: "string", description: "Google Doc ID" },
+        imageUrl: { type: "string", description: "Publicly accessible image URL" },
+        index: { type: "number", description: "Character index where the image should be inserted" },
+      },
+      required: ["documentId", "imageUrl", "index"],
     },
   },
   {
@@ -168,6 +201,68 @@ async function handleTool(env, name, args) {
         shared: true,
       });
     }
+
+    case "doc_create_with_flowchart": {
+      const doc = await callDocs(env, "POST", "/documents", { title: a.title });
+      if (doc._error) return toolResult(doc);
+      const docId = doc.documentId;
+      let diagramInserted = false;
+
+      await callDocs(env, "POST", `/documents/${docId}:batchUpdate`, {
+        requests: [{ insertText: { location: { index: 1 }, text: a.contentBefore + "\n" } }],
+      });
+
+      const docAfterBefore = await callDocs(env, "GET", `/documents/${docId}`);
+      if (!docAfterBefore._error) {
+        const bodyContent = docAfterBefore.body?.content || [];
+        const lastEl = bodyContent[bodyContent.length - 1];
+        const insertIdx = lastEl?.endIndex ? lastEl.endIndex - 1 : 1;
+        const imageUrl = buildMermaidUrl(a.mermaidSource);
+        const imgResult = await callDocs(env, "POST", `/documents/${docId}:batchUpdate`, {
+          requests: [{
+            insertInlineImage: {
+              location: { index: insertIdx },
+              uri: imageUrl,
+              objectSize: {
+                width: { magnitude: 300, unit: "PT" },
+                height: { magnitude: 350, unit: "PT" },
+              },
+            },
+          }],
+        });
+        if (!imgResult._error) diagramInserted = true;
+      }
+
+      const docAfterImage = await callDocs(env, "GET", `/documents/${docId}`);
+      if (!docAfterImage._error) {
+        const bodyContent = docAfterImage.body?.content || [];
+        const lastEl = bodyContent[bodyContent.length - 1];
+        const afterIdx = lastEl?.endIndex ? lastEl.endIndex - 1 : 1;
+        await callDocs(env, "POST", `/documents/${docId}:batchUpdate`, {
+          requests: [{ insertText: { location: { index: afterIdx }, text: "\n" + a.contentAfter } }],
+        });
+      }
+
+      if (a.folderId) {
+        await callDrive(env, "PATCH", `/files/${docId}?addParents=${a.folderId}&fields=id`, {});
+      }
+
+      const token = await getAccessToken(env);
+      await fetch(`https://www.googleapis.com/drive/v3/files/${docId}/permissions`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ role: "reader", type: "anyone" }),
+      });
+
+      return toolResult({
+        documentId: docId, title: a.title,
+        url: `https://docs.google.com/document/d/${docId}/edit`,
+        viewUrl: `https://docs.google.com/document/d/${docId}`,
+        shared: true,
+        diagramInserted,
+      });
+    }
+
     case "doc_get": {
       const doc = await callDocs(env, "GET", `/documents/${a.documentId}`);
       if (doc._error) return toolResult(doc);
@@ -183,6 +278,7 @@ async function handleTool(env, name, args) {
       }
       return toolResult({ documentId: doc.documentId, title: doc.title, content: text, url: `https://docs.google.com/document/d/${doc.documentId}/edit` });
     }
+
     case "doc_append": {
       const doc = await callDocs(env, "GET", `/documents/${a.documentId}`);
       if (doc._error) return toolResult(doc);
@@ -194,6 +290,7 @@ async function handleTool(env, name, args) {
       });
       return toolResult({ documentId: a.documentId, appended: true, url: `https://docs.google.com/document/d/${a.documentId}/edit` });
     }
+
     case "doc_replace": {
       const doc = await callDocs(env, "GET", `/documents/${a.documentId}`);
       if (doc._error) return toolResult(doc);
@@ -206,6 +303,23 @@ async function handleTool(env, name, args) {
       await callDocs(env, "POST", `/documents/${a.documentId}:batchUpdate`, { requests });
       return toolResult({ documentId: a.documentId, replaced: true, url: `https://docs.google.com/document/d/${a.documentId}/edit` });
     }
+
+    case "doc_insert_image": {
+      const result = await callDocs(env, "POST", `/documents/${a.documentId}:batchUpdate`, {
+        requests: [{
+          insertInlineImage: {
+            location: { index: a.index },
+            uri: a.imageUrl,
+            objectSize: {
+              width: { magnitude: 300, unit: "PT" },
+              height: { magnitude: 350, unit: "PT" },
+            },
+          },
+        }],
+      });
+      return toolResult({ documentId: a.documentId, imageInserted: !result._error, url: `https://docs.google.com/document/d/${a.documentId}/edit` });
+    }
+
     case "doc_share": {
       const token = await getAccessToken(env);
       const role = a.role || "reader";
@@ -216,6 +330,7 @@ async function handleTool(env, name, args) {
       });
       return toolResult({ documentId: a.documentId, shared: true, role, url: `https://docs.google.com/document/d/${a.documentId}/edit` });
     }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
