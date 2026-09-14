@@ -1,0 +1,7 @@
+name = "google-docs-mcp-server"
+main = "src/index.js"
+compatibility_date = "2024-09-01"
+
+[[kv_namespaces]]
+binding = "GOOGLE_TOKENS"
+id = "PLACEHOLDER_KV_ID"
