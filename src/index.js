@@ -1,457 +1,58 @@
-// Google Docs MCP Server — Zero dependencies
-// OAuth 2.0 with auto-refresh, tokens stored in Cloudflare KV
-
-const SERVER_INFO = { name: "google-docs-api", version: "1.2.0" };
-const PROTOCOL_VERSION = "2024-11-05";
-const TOKEN_URL = "https://oauth2.googleapis.com/token";
-const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
-const KV_KEY = "google_oauth_tokens";
-const SCOPES = "https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive.file";
-
-async function getTokens(env) {
-  const raw = await env.GOOGLE_TOKENS.get(KV_KEY);
-  if (!raw) return null;
-  return JSON.parse(raw);
-}
-
-async function saveTokens(env, tokens) {
-  const existing = await getTokens(env);
-  await env.GOOGLE_TOKENS.put(KV_KEY, JSON.stringify({
-    access_token: tokens.access_token,
-    refresh_token: tokens.refresh_token || existing?.refresh_token,
-    expires_at: Date.now() + (tokens.expires_in || 3600) * 1000 - 60000,
-  }));
-}
-
-async function refreshAccessToken(env) {
-  const tokens = await getTokens(env);
-  if (!tokens?.refresh_token) throw new Error("No refresh token. Visit /auth to authorize.");
-  const res = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(tokens.refresh_token)}&client_id=${encodeURIComponent(env.GOOGLE_CLIENT_ID)}&client_secret=${encodeURIComponent(env.GOOGLE_CLIENT_SECRET)}`,
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Token refresh failed (${res.status}): ${err}`);
-  }
-  const data = await res.json();
-  await saveTokens(env, data);
-  return data.access_token;
-}
-
-async function getAccessToken(env) {
-  const tokens = await getTokens(env);
-  if (!tokens) throw new Error("Not authorized. Visit /auth to connect Google.");
-  if (Date.now() < tokens.expires_at) return tokens.access_token;
-  return await refreshAccessToken(env);
-}
-
-async function callDocs(env, method, path, body) {
-  const token = await getAccessToken(env);
-  const headers = { Authorization: `Bearer ${token}`, Accept: "application/json" };
-  if (body !== undefined) headers["Content-Type"] = "application/json";
-  const res = await fetch(`https://docs.googleapis.com/v1${path}`, {
-    method, headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
-  const text = await res.text();
-  if (!res.ok) return { _error: true, status: res.status, body: text };
-  try { return JSON.parse(text); } catch { return text; }
-}
-
-async function callDrive(env, method, path, body) {
-  const token = await getAccessToken(env);
-  const headers = { Authorization: `Bearer ${token}`, Accept: "application/json" };
-  if (body !== undefined) headers["Content-Type"] = "application/json";
-  const res = await fetch(`https://www.googleapis.com/drive/v3${path}`, {
-    method, headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
-  const text = await res.text();
-  if (!res.ok) return { _error: true, status: res.status, body: text };
-  try { return JSON.parse(text); } catch { return text; }
-}
-
-function toolResult(data) {
-  return { content: [{ type: "text", text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }] };
-}
-
-function buildMermaidUrl(mermaidSource) {
-  const encoded = btoa(unescape(encodeURIComponent(mermaidSource)));
-  return `https://mermaid.ink/img/${encoded}`;
-}
-
-const TOOLS = [
-  {
-    name: "doc_create",
-    description: "Create a new Google Doc with a title and plain-text body content. Auto-shares as viewable by anyone with the link. Returns the document ID and URL.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        title: { type: "string", description: "Document title" },
-        content: { type: "string", description: "Plain text content to insert into the document body" },
-        folderId: { type: "string", description: "Optional Google Drive folder ID to place the doc in" },
-      },
-      required: ["title", "content"],
-    },
-  },
-  {
-    name: "doc_create_with_flowchart",
-    description: "Create a new Google Doc with a Mermaid flowchart image and auto-bolded headings. Inserts contentBefore, then the flowchart image rendered via mermaid.ink, then contentAfter. After insertion, auto-bolds any paragraph starting with 'Exactly How I Will', or matching 'What you'll get' or 'Timeline'. Use for NDIB proposal docs. Auto-shares.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        title: { type: "string", description: "Document title" },
-        contentBefore: { type: "string", description: "Text content BEFORE the flowchart (everything up to and including the Exactly How I Will header line)" },
-        mermaidSource: { type: "string", description: "Mermaid graph TD source. Example: graph TD\\n    A[Set conversion objective] --> B[Write no contract creative]\\n    B --> C[Split by trade angle]" },
-        contentAfter: { type: "string", description: "Text content AFTER the flowchart (numbered steps, What you'll get, Timeline)" },
-        folderId: { type: "string", description: "Optional Google Drive folder ID" },
-      },
-      required: ["title", "contentBefore", "mermaidSource", "contentAfter"],
-    },
-  },
-  {
-    name: "doc_get",
-    description: "Get the full content of a Google Doc by its document ID. Returns the title and plain-text body.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        documentId: { type: "string", description: "Google Doc ID (from the URL)" },
-      },
-      required: ["documentId"],
-    },
-  },
-  {
-    name: "doc_append",
-    description: "Append plain text to the end of an existing Google Doc.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        documentId: { type: "string", description: "Google Doc ID" },
-        content: { type: "string", description: "Text to append" },
-      },
-      required: ["documentId", "content"],
-    },
-  },
-  {
-    name: "doc_replace",
-    description: "Replace all content in an existing Google Doc with new plain text.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        documentId: { type: "string", description: "Google Doc ID" },
-        content: { type: "string", description: "New content to replace the entire body" },
-      },
-      required: ["documentId", "content"],
-    },
-  },
-  {
-    name: "doc_insert_image",
-    description: "Insert an image into an existing Google Doc at a specific character index. Works with any publicly accessible image URL including mermaid.ink.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        documentId: { type: "string", description: "Google Doc ID" },
-        imageUrl: { type: "string", description: "Publicly accessible image URL" },
-        index: { type: "number", description: "Character index where the image should be inserted" },
-      },
-      required: ["documentId", "imageUrl", "index"],
-    },
-  },
-  {
-    name: "doc_share",
-    description: "Make a Google Doc viewable (or writable) by anyone with the link.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        documentId: { type: "string", description: "Google Doc ID" },
-        role: { type: "string", enum: ["reader", "writer", "commenter"], description: "Permission level (default: reader)" },
-      },
-      required: ["documentId"],
-    },
-  },
+// Google Docs MCP Server - structured editing
+const SERVER_INFO={name:"google-docs-api",version:"1.3.0"};
+const PROTOCOL_VERSION="2024-11-05";
+const TOKEN_URL="https://oauth2.googleapis.com/token",AUTH_URL="https://accounts.google.com/o/oauth2/v2/auth",KV_KEY="google_oauth_tokens";
+const SCOPES="https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive.file";
+async function getTokens(e){const r=await e.GOOGLE_TOKENS.get(KV_KEY);return r?JSON.parse(r):null}
+async function saveTokens(e,t){const old=await getTokens(e);await e.GOOGLE_TOKENS.put(KV_KEY,JSON.stringify({access_token:t.access_token,refresh_token:t.refresh_token||old?.refresh_token,expires_at:Date.now()+(t.expires_in||3600)*1000-60000}))}
+async function refresh(e){const t=await getTokens(e);if(!t?.refresh_token)throw Error("No refresh token. Visit /auth to authorize.");const r=await fetch(TOKEN_URL,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:`grant_type=refresh_token&refresh_token=${encodeURIComponent(t.refresh_token)}&client_id=${encodeURIComponent(e.GOOGLE_CLIENT_ID)}&client_secret=${encodeURIComponent(e.GOOGLE_CLIENT_SECRET)}`});if(!r.ok)throw Error(`Token refresh failed (${r.status}): ${await r.text()}`);const d=await r.json();await saveTokens(e,d);return d.access_token}
+async function token(e){const t=await getTokens(e);if(!t)throw Error("Not authorized. Visit /auth to connect Google.");return Date.now()<t.expires_at?t.access_token:refresh(e)}
+async function api(e,base,method,path,body){const h={Authorization:`Bearer ${await token(e)}`,Accept:"application/json"};if(body!==undefined)h["Content-Type"]="application/json";const r=await fetch(base+path,{method,headers:h,body:body===undefined?undefined:JSON.stringify(body)}),txt=await r.text();if(!r.ok)return{_error:true,status:r.status,body:txt};try{return JSON.parse(txt)}catch{return txt}}
+const docs=(e,m,p,b)=>api(e,"https://docs.googleapis.com/v1",m,p,b),drive=(e,m,p,b)=>api(e,"https://www.googleapis.com/drive/v3",m,p,b);
+const result=d=>({content:[{type:"text",text:typeof d==="string"?d:JSON.stringify(d,null,2)}]});
+function url(id){return `https://docs.google.com/document/d/${id}/edit`}
+function textOf(doc){let s="";for(const x of doc.body?.content||[])for(const y of x.paragraph?.elements||[])if(y.textRun?.content)s+=y.textRun.content;return s}
+function endIndex(doc){const b=doc.body?.content||[],x=b[b.length-1];return x?.endIndex?x.endIndex-1:1}
+function tool(name,description,properties,required=[]){return{name,description,inputSchema:{type:"object",properties,required}}}
+const S={type:"string"},N={type:"number"},BOOL={type:"boolean"};
+const TOOLS=[
+ tool("doc_create","Create a Google Doc with initial text, optionally in a Drive folder.",{title:S,content:S,folderId:S},["title","content"]),
+ tool("doc_get","Read a Google Doc as plain text.",{documentId:S},["documentId"]),
+ tool("doc_get_structure","Read the raw structured Google Docs document model, including paragraphs, tables, styles, and indexes.",{documentId:S},["documentId"]),
+ tool("doc_append","Append text to the end of a Google Doc.",{documentId:S,content:S},["documentId","content"]),
+ tool("doc_replace","Replace the entire body with text.",{documentId:S,content:S},["documentId","content"]),
+ tool("doc_insert_text","Insert text at an exact character index.",{documentId:S,index:N,content:S},["documentId","index","content"]),
+ tool("doc_delete_range","Delete content between exact character indexes.",{documentId:S,startIndex:N,endIndex:N},["documentId","startIndex","endIndex"]),
+ tool("doc_find_replace","Find and replace text throughout a document.",{documentId:S,find:S,replace:S,matchCase:BOOL},["documentId","find","replace"]),
+ tool("doc_update_text_style","Apply structured text formatting to a character range. Supports bold, italic, underline, strikethrough, fontSize, foregroundColor, backgroundColor, weightedFontFamily, and link.",{documentId:S,startIndex:N,endIndex:N,style:{type:"object"},fields:S},["documentId","startIndex","endIndex","style","fields"]),
+ tool("doc_update_paragraph_style","Apply paragraph formatting to a range. Supports namedStyleType, alignment, lineSpacing, spaceAbove, spaceBelow, indentStart, indentEnd, and keepWithNext.",{documentId:S,startIndex:N,endIndex:N,style:{type:"object"},fields:S},["documentId","startIndex","endIndex","style","fields"]),
+ tool("doc_insert_table","Insert a table at an exact character index.",{documentId:S,rows:N,columns:N,index:N},["documentId","rows","columns","index"]),
+ tool("doc_insert_image","Insert a public image at an exact character index.",{documentId:S,imageUrl:S,index:N,widthPt:N,heightPt:N},["documentId","imageUrl","index"]),
+ tool("doc_create_with_flowchart","Create a formatted Doc with text, a Mermaid flowchart, and trailing text.",{title:S,contentBefore:S,mermaidSource:S,contentAfter:S,folderId:S},["title","contentBefore","mermaidSource","contentAfter"]),
+ tool("doc_share","Share a Doc with anyone by link at reader, commenter, or writer level.",{documentId:S,role:S},["documentId"])
 ];
-
-async function handleTool(env, name, args) {
-  const a = args || {};
-  switch (name) {
-    case "doc_create": {
-      const doc = await callDocs(env, "POST", "/documents", { title: a.title });
-      if (doc._error) return toolResult(doc);
-      const docId = doc.documentId;
-      if (a.content) {
-        await callDocs(env, "POST", `/documents/${docId}:batchUpdate`, {
-          requests: [{ insertText: { location: { index: 1 }, text: a.content } }],
-        });
-      }
-      if (a.folderId) {
-        await callDrive(env, "PATCH", `/files/${docId}?addParents=${a.folderId}&fields=id`, {});
-      }
-      const token = await getAccessToken(env);
-      await fetch(`https://www.googleapis.com/drive/v3/files/${docId}/permissions`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ role: "reader", type: "anyone" }),
-      });
-      return toolResult({
-        documentId: docId, title: a.title,
-        url: `https://docs.google.com/document/d/${docId}/edit`,
-        viewUrl: `https://docs.google.com/document/d/${docId}`,
-        shared: true,
-      });
-    }
-
-    case "doc_create_with_flowchart": {
-      const doc = await callDocs(env, "POST", "/documents", { title: a.title });
-      if (doc._error) return toolResult(doc);
-      const docId = doc.documentId;
-      let diagramInserted = false;
-
-      await callDocs(env, "POST", `/documents/${docId}:batchUpdate`, {
-        requests: [{ insertText: { location: { index: 1 }, text: a.contentBefore + "\n" } }],
-      });
-
-      const docAfterBefore = await callDocs(env, "GET", `/documents/${docId}`);
-      if (!docAfterBefore._error) {
-        const bodyContent = docAfterBefore.body?.content || [];
-        const lastEl = bodyContent[bodyContent.length - 1];
-        const insertIdx = lastEl?.endIndex ? lastEl.endIndex - 1 : 1;
-        const imageUrl = buildMermaidUrl(a.mermaidSource);
-        const imgResult = await callDocs(env, "POST", `/documents/${docId}:batchUpdate`, {
-          requests: [{
-            insertInlineImage: {
-              location: { index: insertIdx },
-              uri: imageUrl,
-              objectSize: {
-                width: { magnitude: 300, unit: "PT" },
-                height: { magnitude: 350, unit: "PT" },
-              },
-            },
-          }],
-        });
-        if (!imgResult._error) diagramInserted = true;
-      }
-
-      const docAfterImage = await callDocs(env, "GET", `/documents/${docId}`);
-      if (!docAfterImage._error) {
-        const bodyContent = docAfterImage.body?.content || [];
-        const lastEl = bodyContent[bodyContent.length - 1];
-        const afterIdx = lastEl?.endIndex ? lastEl.endIndex - 1 : 1;
-        await callDocs(env, "POST", `/documents/${docId}:batchUpdate`, {
-          requests: [{ insertText: { location: { index: afterIdx }, text: "\n" + a.contentAfter } }],
-        });
-      }
-
-      const finalDoc = await callDocs(env, "GET", `/documents/${docId}`);
-      if (!finalDoc._error && finalDoc.body?.content) {
-        const boldRequests = [];
-        for (const el of finalDoc.body.content) {
-          if (!el.paragraph?.elements) continue;
-          let paraText = "";
-          for (const e of el.paragraph.elements) {
-            if (e.textRun?.content) paraText += e.textRun.content;
-          }
-          const trimmed = paraText.trim();
-          if (trimmed.startsWith("Exactly How I Will") || trimmed === "What you'll get" || trimmed === "Timeline") {
-            boldRequests.push({
-              updateTextStyle: {
-                range: { startIndex: el.startIndex, endIndex: el.endIndex - 1 },
-                textStyle: { bold: true },
-                fields: "bold",
-              },
-            });
-          }
-        }
-        if (boldRequests.length > 0) {
-          await callDocs(env, "POST", `/documents/${docId}:batchUpdate`, { requests: boldRequests });
-        }
-      }
-
-      if (a.folderId) {
-        await callDrive(env, "PATCH", `/files/${docId}?addParents=${a.folderId}&fields=id`, {});
-      }
-
-      const token = await getAccessToken(env);
-      await fetch(`https://www.googleapis.com/drive/v3/files/${docId}/permissions`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ role: "reader", type: "anyone" }),
-      });
-
-      return toolResult({
-        documentId: docId, title: a.title,
-        url: `https://docs.google.com/document/d/${docId}/edit`,
-        viewUrl: `https://docs.google.com/document/d/${docId}`,
-        shared: true,
-        diagramInserted,
-        boldHeadings: true,
-      });
-    }
-
-    case "doc_get": {
-      const doc = await callDocs(env, "GET", `/documents/${a.documentId}`);
-      if (doc._error) return toolResult(doc);
-      let text = "";
-      if (doc.body?.content) {
-        for (const el of doc.body.content) {
-          if (el.paragraph?.elements) {
-            for (const e of el.paragraph.elements) {
-              if (e.textRun?.content) text += e.textRun.content;
-            }
-          }
-        }
-      }
-      return toolResult({ documentId: doc.documentId, title: doc.title, content: text, url: `https://docs.google.com/document/d/${doc.documentId}/edit` });
-    }
-
-    case "doc_append": {
-      const doc = await callDocs(env, "GET", `/documents/${a.documentId}`);
-      if (doc._error) return toolResult(doc);
-      const body = doc.body?.content || [];
-      const lastEl = body[body.length - 1];
-      const endIdx = lastEl?.endIndex ? lastEl.endIndex - 1 : 1;
-      await callDocs(env, "POST", `/documents/${a.documentId}:batchUpdate`, {
-        requests: [{ insertText: { location: { index: endIdx }, text: a.content } }],
-      });
-      return toolResult({ documentId: a.documentId, appended: true, url: `https://docs.google.com/document/d/${a.documentId}/edit` });
-    }
-
-    case "doc_replace": {
-      const doc = await callDocs(env, "GET", `/documents/${a.documentId}`);
-      if (doc._error) return toolResult(doc);
-      const body = doc.body?.content || [];
-      const lastEl = body[body.length - 1];
-      const endIdx = lastEl?.endIndex ? lastEl.endIndex - 1 : 1;
-      const requests = [];
-      if (endIdx > 1) requests.push({ deleteContentRange: { range: { startIndex: 1, endIndex: endIdx } } });
-      requests.push({ insertText: { location: { index: 1 }, text: a.content } });
-      await callDocs(env, "POST", `/documents/${a.documentId}:batchUpdate`, { requests });
-      return toolResult({ documentId: a.documentId, replaced: true, url: `https://docs.google.com/document/d/${a.documentId}/edit` });
-    }
-
-    case "doc_insert_image": {
-      const result = await callDocs(env, "POST", `/documents/${a.documentId}:batchUpdate`, {
-        requests: [{
-          insertInlineImage: {
-            location: { index: a.index },
-            uri: a.imageUrl,
-            objectSize: {
-              width: { magnitude: 300, unit: "PT" },
-              height: { magnitude: 350, unit: "PT" },
-            },
-          },
-        }],
-      });
-      return toolResult({ documentId: a.documentId, imageInserted: !result._error, url: `https://docs.google.com/document/d/${a.documentId}/edit` });
-    }
-
-    case "doc_share": {
-      const token = await getAccessToken(env);
-      const role = a.role || "reader";
-      await fetch(`https://www.googleapis.com/drive/v3/files/${a.documentId}/permissions`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ role, type: "anyone" }),
-      });
-      return toolResult({ documentId: a.documentId, shared: true, role, url: `https://docs.google.com/document/d/${a.documentId}/edit` });
-    }
-
-    default:
-      throw new Error(`Unknown tool: ${name}`);
-  }
-}
-
-function jsonrpc(id, result) { return { jsonrpc: "2.0", id, result }; }
-function jsonrpcError(id, code, message) { return { jsonrpc: "2.0", id, error: { code, message } }; }
-
-async function handleRpc(env, req) {
-  const { method, params, id } = req;
-  switch (method) {
-    case "initialize":
-      return jsonrpc(id, { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: { listChanged: false } }, serverInfo: SERVER_INFO });
-    case "notifications/initialized":
-    case "notifications/cancelled":
-      return null;
-    case "ping":
-      return jsonrpc(id, {});
-    case "tools/list":
-      return jsonrpc(id, { tools: TOOLS });
-    case "tools/call": {
-      const { name, arguments: toolArgs } = params || {};
-      try {
-        const result = await handleTool(env, name, toolArgs);
-        return jsonrpc(id, result);
-      } catch (err) {
-        return jsonrpc(id, { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true });
-      }
-    }
-    default:
-      return jsonrpcError(id, -32601, `Method not found: ${method}`);
-  }
-}
-
-function handleAuth(env, url) {
-  const redirectUri = `${url.origin}/callback`;
-  const authUrl = `${AUTH_URL}?client_id=${encodeURIComponent(env.GOOGLE_CLIENT_ID)}&response_type=code&scope=${encodeURIComponent(SCOPES)}&redirect_uri=${encodeURIComponent(redirectUri)}&access_type=offline&prompt=consent`;
-  return Response.redirect(authUrl, 302);
-}
-
-async function handleCallback(env, url) {
-  const code = url.searchParams.get("code");
-  const error = url.searchParams.get("error");
-  if (error) return new Response(`OAuth error: ${error}`, { status: 400 });
-  if (!code) return new Response("Missing authorization code", { status: 400 });
-  const redirectUri = `${url.origin}/callback`;
-  const res = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(redirectUri)}&client_id=${encodeURIComponent(env.GOOGLE_CLIENT_ID)}&client_secret=${encodeURIComponent(env.GOOGLE_CLIENT_SECRET)}`,
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    return new Response(`Token exchange failed: ${err}`, { status: 500 });
-  }
-  const tokens = await res.json();
-  await saveTokens(env, tokens);
-  return new Response(
-    '<html><body style="font-family:sans-serif;text-align:center;padding:60px"><h1>Connected to Google Docs!</h1><p>You can close this window. Brain now has access to Google Docs.</p></body></html>',
-    { headers: { "Content-Type": "text/html" } }
-  );
-}
-
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    if (url.pathname === "/health") {
-      const tokens = await getTokens(env);
-      return Response.json({ status: "ok", google_connected: !!tokens?.refresh_token });
-    }
-    if (url.pathname === "/auth") return handleAuth(env, url);
-    if (url.pathname === "/callback") return await handleCallback(env, url);
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id" },
-      });
-    }
-    if (env.MCP_AUTH_TOKEN) {
-      const auth = request.headers.get("Authorization");
-      if (auth !== `Bearer ${env.MCP_AUTH_TOKEN}`) return new Response("Unauthorized", { status: 401 });
-    }
-    if (!url.pathname.startsWith("/mcp")) return new Response("Not found", { status: 404 });
-    if (request.method === "GET") return new Response("Use POST for MCP requests", { status: 405 });
-    if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
-    let body;
-    try { body = await request.json(); } catch { return Response.json(jsonrpcError(null, -32700, "Parse error"), { status: 400 }); }
-    const headers = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" };
-    if (Array.isArray(body)) {
-      const results = [];
-      for (const req of body) { const res = await handleRpc(env, req); if (res !== null) results.push(res); }
-      if (results.length === 0) return new Response(null, { status: 202, headers });
-      return Response.json(results, { headers });
-    }
-    const result = await handleRpc(env, body);
-    if (result === null) return new Response(null, { status: 202, headers });
-    return Response.json(result, { headers });
-  },
-};
+function mermaid(s){return `https://mermaid.ink/img/${btoa(unescape(encodeURIComponent(s)))}`}
+async function permission(e,id,role="reader"){return fetch(`https://www.googleapis.com/drive/v3/files/${id}/permissions`,{method:"POST",headers:{Authorization:`Bearer ${await token(e)}`,"Content-Type":"application/json"},body:JSON.stringify({role,type:"anyone"})})}
+async function handle(e,name,a={}){let d,r;
+ switch(name){
+ case"doc_create":d=await docs(e,"POST","/documents",{title:a.title});if(d._error)return result(d);if(a.content)await docs(e,"POST",`/documents/${d.documentId}:batchUpdate`,{requests:[{insertText:{location:{index:1},text:a.content}}]});if(a.folderId)await drive(e,"PATCH",`/files/${d.documentId}?addParents=${encodeURIComponent(a.folderId)}&fields=id`,{});await permission(e,d.documentId);return result({documentId:d.documentId,title:a.title,url:url(d.documentId),shared:true});
+ case"doc_get":d=await docs(e,"GET",`/documents/${a.documentId}`);return result(d._error?d:{documentId:d.documentId,title:d.title,content:textOf(d),url:url(d.documentId)});
+ case"doc_get_structure":d=await docs(e,"GET",`/documents/${a.documentId}`);return result(d);
+ case"doc_append":d=await docs(e,"GET",`/documents/${a.documentId}`);if(d._error)return result(d);r=await docs(e,"POST",`/documents/${a.documentId}:batchUpdate`,{requests:[{insertText:{location:{index:endIndex(d)},text:a.content}}]});return result({documentId:a.documentId,appended:!r._error,url:url(a.documentId),response:r});
+ case"doc_replace":d=await docs(e,"GET",`/documents/${a.documentId}`);if(d._error)return result(d);{const end=endIndex(d),q=[];if(end>1)q.push({deleteContentRange:{range:{startIndex:1,endIndex:end}}});q.push({insertText:{location:{index:1},text:a.content}});r=await docs(e,"POST",`/documents/${a.documentId}:batchUpdate`,{requests:q});return result({documentId:a.documentId,replaced:!r._error,url:url(a.documentId),response:r})}
+ case"doc_insert_text":r=await docs(e,"POST",`/documents/${a.documentId}:batchUpdate`,{requests:[{insertText:{location:{index:a.index},text:a.content}}]});return result({documentId:a.documentId,inserted:!r._error,response:r,url:url(a.documentId)});
+ case"doc_delete_range":r=await docs(e,"POST",`/documents/${a.documentId}:batchUpdate`,{requests:[{deleteContentRange:{range:{startIndex:a.startIndex,endIndex:a.endIndex}}}]});return result({documentId:a.documentId,deleted:!r._error,response:r,url:url(a.documentId)});
+ case"doc_find_replace":r=await docs(e,"POST",`/documents/${a.documentId}:batchUpdate`,{requests:[{replaceAllText:{containsText:{text:a.find,matchCase:a.matchCase!==false},replaceText:a.replace}}]});return result({documentId:a.documentId,replaced:!r._error,response:r,url:url(a.documentId)});
+ case"doc_update_text_style":r=await docs(e,"POST",`/documents/${a.documentId}:batchUpdate`,{requests:[{updateTextStyle:{range:{startIndex:a.startIndex,endIndex:a.endIndex},textStyle:a.style,fields:a.fields}}]});return result({documentId:a.documentId,styled:!r._error,response:r,url:url(a.documentId)});
+ case"doc_update_paragraph_style":r=await docs(e,"POST",`/documents/${a.documentId}:batchUpdate`,{requests:[{updateParagraphStyle:{range:{startIndex:a.startIndex,endIndex:a.endIndex},paragraphStyle:a.style,fields:a.fields}}]});return result({documentId:a.documentId,styled:!r._error,response:r,url:url(a.documentId)});
+ case"doc_insert_table":r=await docs(e,"POST",`/documents/${a.documentId}:batchUpdate`,{requests:[{insertTable:{rows:a.rows,columns:a.columns,location:{index:a.index}}}]});return result({documentId:a.documentId,inserted:!r._error,response:r,url:url(a.documentId)});
+ case"doc_insert_image":r=await docs(e,"POST",`/documents/${a.documentId}:batchUpdate`,{requests:[{insertInlineImage:{location:{index:a.index},uri:a.imageUrl,objectSize:{width:{magnitude:a.widthPt||300,unit:"PT"},height:{magnitude:a.heightPt||200,unit:"PT"}}}}]});return result({documentId:a.documentId,inserted:!r._error,response:r,url:url(a.documentId)});
+ case"doc_create_with_flowchart":{d=await docs(e,"POST","/documents",{title:a.title});if(d._error)return result(d);const id=d.documentId;await docs(e,"POST",`/documents/${id}:batchUpdate`,{requests:[{insertText:{location:{index:1},text:a.contentBefore+"\n"}}]});let cur=await docs(e,"GET",`/documents/${id}`);await docs(e,"POST",`/documents/${id}:batchUpdate`,{requests:[{insertInlineImage:{location:{index:endIndex(cur)},uri:mermaid(a.mermaidSource),objectSize:{width:{magnitude:300,unit:"PT"},height:{magnitude:350,unit:"PT"}}}}]});cur=await docs(e,"GET",`/documents/${id}`);await docs(e,"POST",`/documents/${id}:batchUpdate`,{requests:[{insertText:{location:{index:endIndex(cur)},text:"\n"+a.contentAfter}}]});if(a.folderId)await drive(e,"PATCH",`/files/${id}?addParents=${encodeURIComponent(a.folderId)}&fields=id`,{});await permission(e,id);return result({documentId:id,title:a.title,url:url(id),shared:true})}
+ case"doc_share":r=await permission(e,a.documentId,a.role||"reader");return result({documentId:a.documentId,shared:r.ok,role:a.role||"reader",url:url(a.documentId)});
+ default:throw Error(`Unknown tool: ${name}`)
+ }}
+function rpc(id,result){return{jsonrpc:"2.0",id,result}}function rpcErr(id,c,m){return{jsonrpc:"2.0",id,error:{code:c,message:m}}}
+async function route(e,q){const{method,params,id}=q;switch(method){case"initialize":return rpc(id,{protocolVersion:PROTOCOL_VERSION,capabilities:{tools:{listChanged:false}},serverInfo:SERVER_INFO});case"notifications/initialized":case"notifications/cancelled":return null;case"ping":return rpc(id,{});case"tools/list":return rpc(id,{tools:TOOLS});case"tools/call":try{return rpc(id,await handle(e,params?.name,params?.arguments))}catch(x){return rpc(id,{content:[{type:"text",text:`Error: ${x.message}`}],isError:true})}default:return rpcErr(id,-32601,`Method not found: ${method})`)} }
+function auth(e,u){const red=`${u.origin}/callback`;return Response.redirect(`${AUTH_URL}?client_id=${encodeURIComponent(e.GOOGLE_CLIENT_ID)}&response_type=code&scope=${encodeURIComponent(SCOPES)}&redirect_uri=${encodeURIComponent(red)}&access_type=offline&prompt=consent`,302)}
+async function callback(e,u){const code=u.searchParams.get("code"),err=u.searchParams.get("error");if(err)return new Response(`OAuth error: ${err}`,{status:400});if(!code)return new Response("Missing authorization code",{status:400});const red=`${u.origin}/callback`,r=await fetch(TOKEN_URL,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:`grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(red)}&client_id=${encodeURIComponent(e.GOOGLE_CLIENT_ID)}&client_secret=${encodeURIComponent(e.GOOGLE_CLIENT_SECRET)}`});if(!r.ok)return new Response(`Token exchange failed: ${await r.text()}`,{status:500});await saveTokens(e,await r.json());return new Response("<h1>Connected to Google Docs</h1><p>You can close this window.</p>",{headers:{"Content-Type":"text/html"}})}
+export default{async fetch(req,e){const u=new URL(req.url);if(u.pathname==="/health")return Response.json({status:"ok",google_connected:!!(await getTokens(e))?.refresh_token});if(u.pathname==="/auth")return auth(e,u);if(u.pathname==="/callback")return callback(e,u);if(req.method==="OPTIONS")return new Response(null,{headers:{"Access-Control-Allow-Origin":"*","Access-Control-Allow-Methods":"GET, POST, OPTIONS","Access-Control-Allow-Headers":"Content-Type, Authorization, Mcp-Session-Id"}});if(e.MCP_AUTH_TOKEN&&req.headers.get("Authorization")!==`Bearer ${e.MCP_AUTH_TOKEN}`)return new Response("Unauthorized",{status:401});if(!u.pathname.startsWith("/mcp"))return new Response("Not found",{status:404});if(req.method!=="POST")return new Response("Use POST for MCP requests",{status:405});let body;try{body=await req.json()}catch{return Response.json(rpcErr(null,-32700,"Parse error"),{status:400})}const h={"Content-Type":"application/json","Access-Control-Allow-Origin":"*"};if(Array.isArray(body)){const out=[];for(const q of body){const x=await route(e,q);if(x)out.push(x)}return out.length?Response.json(out,{headers:h}):new Response(null,{status:202,headers:h})}const out=await route(e,body);return out?Response.json(out,{headers:h}):new Response(null,{status:202,headers:h})}};
