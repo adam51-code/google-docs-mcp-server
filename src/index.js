@@ -1,4 +1,4 @@
-const SERVER_INFO={name:"google-docs-api",version:"1.4.0"};
+const SERVER_INFO={name:"google-docs-api",version:"1.5.0"};
 const PROTOCOL_VERSION="2024-11-05",TOKEN_URL="https://oauth2.googleapis.com/token",AUTH_URL="https://accounts.google.com/o/oauth2/v2/auth",KV_KEY="google_oauth_tokens";
 const SCOPES="https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive.file";
 async function getTokens(e){const x=await e.GOOGLE_TOKENS.get(KV_KEY);return x?JSON.parse(x):null}
@@ -12,6 +12,7 @@ const S={type:"string"},N={type:"number"},B={type:"boolean"},O={type:"object"};
 function T(name,description,properties,required=[]){return{name,description,inputSchema:{type:"object",properties,required}}}
 const TOOLS=[
  T("doc_create","Create a Google Doc with initial text.",{title:S,content:S,folderId:S},["title","content"]),
+ T("doc_create_with_flow","Create a proposal Google Doc: lines wrapped in **double asterisks** become bold headings (markers stripped), and a Mermaid flowchart image of the plan steps is embedded right after the numbered list. Steps default to the numbered lines in content. Auto-shared anyone-with-link.",{title:S,content:S,steps:{type:"array",items:S},folderId:S,imageWidthPt:N},["title","content"]),
  T("doc_get","Read a Google Doc, including all tab content, as plain text.",{documentId:S},["documentId"]),
  T("doc_get_structure","Read the full structured Google Docs model, including tabs, paragraphs, tables, styles, and indexes.",{documentId:S},["documentId"]),
  T("doc_list_tabs","List all tabs and nested child tabs in a Google Doc.",{documentId:S},["documentId"]),
@@ -35,10 +36,15 @@ function end(d,id){const c=body(d,id).content||[],x=c[c.length-1];return x?.endI
 function flatTabs(ts=[],parent=null){return ts.flatMap(t=>[{tabId:t.tabProperties?.tabId,title:t.tabProperties?.title,index:t.tabProperties?.index,parentTabId:parent},...flatTabs(t.childTabs||[],t.tabProperties?.tabId)])}
 function range(a,s,e){const r={startIndex:s,endIndex:e};if(a.tabId)r.tabId=a.tabId;return r}
 function loc(a,i){const r={index:i};if(a.tabId)r.tabId=a.tabId;return r}
+function b64u(s){const b=new TextEncoder().encode(s);let x="";for(const c of b)x+=String.fromCharCode(c);return btoa(x).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}
+function lbl(s){s=String(s).replace(/^\d+[.)]\s*/,"").split(/\s[-:]\s/)[0].replace(/["`]/g,"'").replace(/[\[\]{}()<>|#;]/g," ").trim();return s.length>48?s.slice(0,45).trim()+"...":s}
+function mermaid(steps){let m="flowchart TD\n";steps.forEach((s,i)=>{m+=`  S${i+1}["${i+1}. ${lbl(s)}"]\n`;if(i)m+=`  S${i} --> S${i+1}\n`});return m}
+function prep(content){const lines=String(content).split("\n"),heads=[],nums=[];let text="",i=1;for(const raw of lines){const h=raw.trim().match(/^\*\*(.+?)\*\*:?$/);const line=h?h[1].trim():raw;const len=line.length;if(h&&len)heads.push([i,i+len]);if(/^\s*\d+[.)]\s+\S/.test(line))nums.push({text:line.trim(),end:i+len+1});text+=line+"\n";i+=len+1}return{text,heads,nums}}
 async function perm(e,id,role="reader"){return fetch(`https://www.googleapis.com/drive/v3/files/${id}/permissions`,{method:"POST",headers:{Authorization:`Bearer ${await token(e)}`,"Content-Type":"application/json"},body:JSON.stringify({role,type:"anyone"})})}
 async function handle(e,n,a={}){let d,r;
  switch(n){
  case"doc_create":d=await docs(e,"POST","/documents",{title:a.title});if(d._error)return out(d);if(a.content)await docs(e,"POST",`/documents/${d.documentId}:batchUpdate`,{requests:[{insertText:{location:{index:1},text:a.content}}]});if(a.folderId)await drive(e,"PATCH",`/files/${d.documentId}?addParents=${encodeURIComponent(a.folderId)}&fields=id`,{});await perm(e,d.documentId);return out({documentId:d.documentId,title:a.title,url:url(d.documentId),shared:true});
+ case"doc_create_with_flow":{d=await docs(e,"POST","/documents",{title:a.title});if(d._error)return out(d);const id=d.documentId,p=prep(a.content||""),q=[{insertText:{location:{index:1},text:p.text}}];for(const[s,z]of p.heads)q.push({updateTextStyle:{range:{startIndex:s,endIndex:z},textStyle:{bold:true},fields:"bold"}});r=await docs(e,"POST",`/documents/${id}:batchUpdate`,{requests:q});if(r._error)return out({documentId:id,url:url(id),textInserted:false,error:r});const steps=(Array.isArray(a.steps)&&a.steps.length?a.steps:p.nums.map(x=>x.text)).filter(Boolean);let flow={embedded:false,reason:"no steps found"};if(steps.length){const m=mermaid(steps),img=`https://mermaid.ink/img/${b64u(m)}?type=png&bgColor=FFFFFF`;const at=p.nums.length?p.nums[p.nums.length-1].end:p.text.length+1;const w=await docs(e,"POST",`/documents/${id}:batchUpdate`,{requests:[{insertText:{location:{index:at},text:"\n"}},{insertInlineImage:{location:{index:at},uri:img,objectSize:{width:{magnitude:a.imageWidthPt||440,unit:"PT"}}}}]});flow=w._error?{embedded:false,imageUrl:img,mermaid:m,error:w}:{embedded:true,imageUrl:img,steps:steps.length}}if(a.folderId)await drive(e,"PATCH",`/files/${id}?addParents=${encodeURIComponent(a.folderId)}&fields=id`,{});await perm(e,id);return out({documentId:id,title:a.title,url:url(id),shared:true,headingsBolded:p.heads.length,flow})}
  case"doc_get":d=await docs(e,"GET",`/documents/${a.documentId}?includeTabsContent=true`);if(d._error)return out(d);return out({documentId:d.documentId,title:d.title,tabs:flatTabs(d.tabs||[]),content:(d.tabs||[]).map(t=>({tabId:t.tabProperties?.tabId,title:t.tabProperties?.title,text:(()=>{let s="";for(const x of t.documentTab?.body?.content||[])for(const y of x.paragraph?.elements||[])if(y.textRun?.content)s+=y.textRun.content;return s})()})),url:url(d.documentId)});
  case"doc_get_structure":d=await docs(e,"GET",`/documents/${a.documentId}?includeTabsContent=true`);return out(d);
  case"doc_list_tabs":d=await docs(e,"GET",`/documents/${a.documentId}?includeTabsContent=false`);return out(d._error?d:{documentId:a.documentId,tabs:flatTabs(d.tabs||[])});
