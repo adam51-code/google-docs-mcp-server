@@ -1,4 +1,4 @@
-const SERVER_INFO={name:"google-docs-api",version:"1.5.0"};
+const SERVER_INFO={name:"google-docs-api",version:"1.6.0"};
 const PROTOCOL_VERSION="2024-11-05",TOKEN_URL="https://oauth2.googleapis.com/token",AUTH_URL="https://accounts.google.com/o/oauth2/v2/auth",KV_KEY="google_oauth_tokens";
 const SCOPES="https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive.file";
 async function getTokens(e){const x=await e.GOOGLE_TOKENS.get(KV_KEY);return x?JSON.parse(x):null}
@@ -28,7 +28,9 @@ const TOOLS=[
  T("doc_update_paragraph_style","Apply paragraph formatting to a range in a selected tab.",{documentId:S,startIndex:N,endIndex:N,style:O,fields:S,tabId:S},["documentId","startIndex","endIndex","style","fields"]),
  T("doc_insert_table","Insert a table in a selected tab.",{documentId:S,rows:N,columns:N,index:N,tabId:S},["documentId","rows","columns","index"]),
  T("doc_insert_image","Insert a public image in a selected tab.",{documentId:S,imageUrl:S,index:N,widthPt:N,heightPt:N,tabId:S},["documentId","imageUrl","index"]),
- T("doc_share","Share a Doc by link.",{documentId:S,role:S},["documentId"])
+ T("doc_share","Share a Doc by link.",{documentId:S,role:S},["documentId"]),
+ T("doc_build_proposal","Build a complete, fully formatted Upwork proposal Google Doc in ONE call. Validates the content first and creates nothing if any rule fails (5-6 steps; 3-6 word lead-ins ending in a period; max 2 steps with I'll; no I'd; exactly 3 deliverables; 350-450 words; no URLs or markdown in content; US spelling; link texts present). Then builds: greeting, intro, optional extra paragraphs, credibility paragraph with real links on the anchor text, the step-by-step line, the plan heading (Heading 3) with the flowchart directly under it (200pt wide, height from the real image ratio, labels = lead-ins), bold lead-ins, blank lines, optional closer line, What you'll get bullets, Timeline, 1.15 spacing, shared by link. Reads the doc back and returns code-verified layout checks.",{title:S,greeting:S,intro:S,extraParagraphs:{type:"array",items:S},credibility:S,links:{type:"array",items:{type:"object",properties:{text:S,url:S},required:["text","url"]}},heading:S,steps:{type:"array",items:{type:"object",properties:{leadin:S,body:S},required:["leadin","body"]}},closer:S,deliverables:{type:"array",items:S},timeline:S,folderId:S,diagramWidthPt:N},["title","greeting","intro","credibility","links","heading","steps","deliverables","timeline"]),
+ T("doc_lint_application","Code check of an Upwork Application field (reference lines, letter, screening answers). Returns pass/fail plus counts: letter chars, I'd, hourly mentions, [ADAM] markers, bio intact, opener, flat-fee close, ending, markdown, British spelling, internal notes leaking into client text, answer paragraphs vs questionCount.",{application:S,gatePhrase:S,platform:S,questionCount:N},["application"])
 ];
 function tabDoc(d,id){const tabs=d.tabs||[];function walk(a){for(const t of a){if(!id||t.tabProperties?.tabId===id)return t;const z=walk(t.childTabs||[]);if(z)return z}}return walk(tabs)}
 function body(d,id){const t=tabDoc(d,id);return t?.documentTab?.body||d.body||{content:[]}}
@@ -41,6 +43,114 @@ function lbl(s){s=String(s).replace(/^\d+[.)]\s*/,"").split(/\s[-:]\s/)[0].repla
 function mermaid(steps){let m="flowchart TD\n";steps.forEach((s,i)=>{m+=`  S${i+1}["${i+1}. ${lbl(s)}"]\n`;if(i)m+=`  S${i} --> S${i+1}\n`});return m}
 function prep(content){const lines=String(content).split("\n"),heads=[],nums=[];let text="",i=1;for(const raw of lines){const h=raw.trim().match(/^\*\*(.+?)\*\*:?$/);const line=h?h[1].trim():raw;const len=line.length;if(h&&len)heads.push([i,i+len]);if(/^\s*\d+[.)]\s+\S/.test(line))nums.push({text:line.trim(),end:i+len+1});text+=line+"\n";i+=len+1}return{text,heads,nums}}
 async function perm(e,id,role="reader"){return fetch(`https://www.googleapis.com/drive/v3/files/${id}/permissions`,{method:"POST",headers:{Authorization:`Bearer ${await token(e)}`,"Content-Type":"application/json"},body:JSON.stringify({role,type:"anyone"})})}
+// ---- v1.6: one-call Upwork proposal builder + application lint ----
+const STEP_LINE="Here's a step-by-step, along with my reasoning at every point:";
+const FLAT_CLOSE="Flat fee, we agree on the outcome up front - no hourly meter. Send a couple of times that work and we'll do a quick 15 minutes.";
+const BIO_RE=/A bit about me: I'm new to Upwork, but not new to (.+?) - I've been doing it for 10\+ years, using a testing process I developed at Harvard\. (?:We're the #1-rated conversion agency in Unbounce's directory \(verify: https:\/\/unbounce\.partnerpage\.io\/\), and I've|I've) been a featured speaker at Wharton and Google's Digital Breakfast\./;
+const BRIT=/\b(optimis\w*|colour\w*|analys(?:e|ed|es|ing)|centre\w*|licence|defence|programme\w*|behaviour\w*|organis\w*|favour\w*|enquir\w*)\b/gi;
+const LEAK=/(I won't invent|role log|person-by-person|scraper|Lead Score|as an AI|placeholder)/gi;
+const WC=s=>(String(s||"").match(/\S+/g)||[]).length;
+const norm=s=>String(s||"").replace(/[\u2018\u2019]/g,"'").replace(/[\u201C\u201D]/g,'"');
+function paras(a){const P=[],add=(t,k,x={})=>P.push({t:String(t),k,...x}),gap=()=>add("","blank");
+ add(norm(a.greeting).trim(),"p");gap();add(norm(a.intro).trim(),"p");gap();
+ for(const x of a.extraParagraphs||[])if(String(x).trim()){add(norm(x).trim(),"p");gap()}
+ add(norm(a.credibility).trim(),"p");gap();add(STEP_LINE,"p");gap();
+ add(norm(a.heading).trim(),"h");add("","img");gap();
+ (a.steps||[]).forEach((s,i)=>{const n=`${i+1}. `,L=norm(s.leadin).trim();add(`${n}${L} ${norm(s.body).trim()}`,"step",{ls:n.length,ll:L.length});gap()});
+ if(String(a.closer||"").trim()){add(norm(a.closer).trim(),"p");gap()}
+ add("What you'll get","h");for(const d of a.deliverables||[])add(`• ${norm(d).trim()}`,"bullet");gap();
+ add("Timeline","h");add(norm(a.timeline).trim(),"p");return P}
+function proposalErrors(a){const E=[],Wn=[],st=Array.isArray(a.steps)?a.steps:[];
+ for(const k of["title","greeting","intro","credibility","heading","timeline"])if(!String(a[k]||"").trim())E.push(`${k} is required`);
+ if(a.greeting&&!/^Hey\b/.test(a.greeting.trim()))E.push('greeting must start with "Hey"');
+ if(st.length<5||st.length>6)E.push(`need 5 or 6 steps, got ${st.length}`);
+ let ill=0;st.forEach((s,i)=>{const L=norm(s.leadin).trim(),Bd=norm(s.body).trim();
+  if(!/\.$/.test(L))E.push(`step ${i+1} lead-in must end with a period`);
+  const lw=WC(L);if(lw<3||lw>6)E.push(`step ${i+1} lead-in is ${lw} words, needs 3-6`);
+  if(!Bd)E.push(`step ${i+1} body is empty`);
+  const sw=WC(L)+WC(Bd);if(sw>50)E.push(`step ${i+1} is ${sw} words, max about 40`);else if(sw>44)Wn.push(`step ${i+1} is ${sw} words`);
+  if(/\bI'll\b/i.test(L+" "+Bd))ill++;
+  const sn=(Bd.match(/[.!?](?=\s|$)/g)||[]).length;if(sn>2)Wn.push(`step ${i+1} body may have ${sn} sentences, max 2`)});
+ if(ill>2)E.push(`${ill} steps contain "I'll", max 2`);
+ const dl=Array.isArray(a.deliverables)?a.deliverables:[];if(dl.length!==3)E.push(`need exactly 3 deliverables, got ${dl.length}`);
+ dl.forEach((d,i)=>{if(WC(d)>12)Wn.push(`deliverable ${i+1} is ${WC(d)} words, keep it short`)});
+ if(/\n/.test(a.timeline||""))E.push("timeline must be one line");
+ if(st.length!==5&&st.length!==6)return{errors:E,warnings:Wn,wordCount:0};
+ const all=paras(a).map(p=>p.t).join("\n");
+ if(/\bI'd\b/i.test(all))E.push(`"I'd" found`);
+ if(/https?:\/\/|www\./i.test(all))E.push("raw URL in content; use anchor text and pass links");
+ if(/\[[^\]]+\]\([^)]*\)/.test(all)||/\*\*/.test(all))E.push("markdown found in content");
+ const br=all.match(BRIT);if(br)E.push(`British spelling: ${[...new Set(br)].join(", ")}`);
+ const lk=Array.isArray(a.links)?a.links:[];if(!lk.length)E.push("links required (Unbounce partner directory and the case study)");
+ lk.forEach(l=>{if(!all.includes(norm(l.text)))E.push(`link text not found in content: "${l.text}"`);if(!/^https?:\/\//.test(l.url||""))E.push(`bad url for "${l.text}"`)});
+ const wc=WC(all);if(wc<350||wc>450)E.push(`word count ${wc}, needs 350-450`);
+ return{errors:E,warnings:Wn,wordCount:wc}}
+async function zlibB64u(s){const cs=new CompressionStream("deflate"),w=cs.writable.getWriter();w.write(new TextEncoder().encode(s));w.close();const b=new Uint8Array(await new Response(cs.readable).arrayBuffer());let x="";for(const c of b)x+=String.fromCharCode(c);return btoa(x).replace(/\+/g,"-").replace(/\//g,"_")}
+async function pngDims(u){try{const r=await fetch(u);if(!r.ok)return null;const b=new Uint8Array(await r.arrayBuffer());if(b.length<24||b[1]!==0x50||b[2]!==0x4E||b[3]!==0x47)return null;const v=new DataView(b.buffer,b.byteOffset);return{w:v.getUint32(16),h:v.getUint32(20)}}catch{return null}}
+const ptxt=x=>(x?.paragraph?.elements||[]).map(y=>y.textRun?.content||"").join("");
+const pimg=x=>(x?.paragraph?.elements||[]).some(y=>y.inlineObjectElement);
+function verifyDoc(d,a){const C=(d.body?.content||[]).filter(x=>x.paragraph),ck={};
+ const isH=x=>x.paragraph.paragraphStyle?.namedStyleType==="HEADING_3";
+ const hs=C.map((x,i)=>i).filter(i=>isH(C[i]));
+ ck.threeHeadingsAreH3=hs.length===3;
+ const hi=C.findIndex(x=>ptxt(x).trim()===norm(a.heading).trim()),ii=C.findIndex(pimg),s1=C.findIndex(x=>/^1\. /.test(ptxt(x)));
+ ck.diagramDirectlyUnderHeading=hi>=0&&ii===hi+1&&s1>ii&&C.filter(pimg).length===1;
+ const ob=Object.values(d.inlineObjects||{})[0]?.inlineObjectProperties?.embeddedObject?.size;
+ ck.diagramWidth200WithHeight=!!ob&&Math.abs((ob.width?.magnitude||0)-(a.diagramWidthPt||200))<0.5&&(ob.height?.magnitude||0)>50;
+ ck.lineSpacing115=C.slice(0,-1).every(x=>x.paragraph.paragraphStyle?.lineSpacing===115);
+ ck.threeBulletLines=C.filter(x=>ptxt(x).startsWith("• ")).length===3;
+ const steps=C.filter(x=>/^\d+\. /.test(ptxt(x)));
+ ck.stepCountMatches=steps.length===(a.steps||[]).length;
+ ck.blankLineBetweenSteps=steps.every((x,k)=>{if(k===steps.length-1)return true;const j=C.indexOf(x);return ptxt(C[j+1]).trim()===""&&!pimg(C[j+1])&&C[j+2]===steps[k+1]});
+ ck.leadinsBoldBodyNot=steps.every((x,k)=>{const L=norm(a.steps[k].leadin).trim(),b=(x.paragraph.elements||[]).filter(y=>y.textRun?.textStyle?.bold).map(y=>y.textRun.content).join("");return b.trim()===L});
+ ck.noBlankUnderHeadings=hs.every(i=>C[i+1]&&(pimg(C[i+1])||ptxt(C[i+1]).trim()!==""));
+ ck.blankAfterGreeting=ptxt(C[1]).trim()===""&&ptxt(C[2]).trim()!=="";
+ const lt=C.flatMap(x=>(x.paragraph.elements||[]).filter(y=>y.textRun?.textStyle?.link).map(y=>y.textRun.content)).join("|");
+ ck.linksApplied=(a.links||[]).every(l=>lt.includes(norm(l.text)));
+ ck.noRawUrlsOrMarkdown=!/https?:\/\/|\*\*|\]\(/.test(C.map(ptxt).join(""));
+ const keys=Object.keys(ck),failed=keys.filter(k=>!ck[k]);return{checks:ck,passed:keys.length-failed.length,total:keys.length,failed}}
+async function buildProposal(e,a){const chk=proposalErrors(a);
+ if(chk.errors.length)return out({built:false,errors:chk.errors,warnings:chk.warnings,wordCount:chk.wordCount,next:"Nothing was created. Fix every error in the content and call doc_build_proposal again."});
+ const P=paras(a);let i=1;for(const p of P){p.s=i;i+=p.t.length+1}const text=P.map(p=>p.t).join("\n"),endI=1+text.length;
+ const title=String(a.title).replace(/\s+/g," ").trim();
+ const d=await docs(e,"POST","/documents",{title});if(d._error)return out({built:false,stage:"create",error:d});const id=d.documentId;
+ const q=[{insertText:{location:{index:1},text}},{updateParagraphStyle:{range:{startIndex:1,endIndex:endI},paragraphStyle:{lineSpacing:115},fields:"lineSpacing"}}];
+ for(const p of P){if(p.k==="h")q.push({updateParagraphStyle:{range:{startIndex:p.s,endIndex:p.s+p.t.length+1},paragraphStyle:{namedStyleType:"HEADING_3"},fields:"namedStyleType"}});
+  if(p.k==="step")q.push({updateTextStyle:{range:{startIndex:p.s+p.ls,endIndex:p.s+p.ls+p.ll},textStyle:{bold:true},fields:"bold"}})}
+ for(const l of a.links||[]){const t=norm(l.text),at=text.indexOf(t);if(at>=0)q.push({updateTextStyle:{range:{startIndex:1+at,endIndex:1+at+t.length},textStyle:{link:{url:l.url},underline:true,foregroundColor:{color:{rgbColor:{red:0.067,green:0.333,blue:0.8}}}},fields:"link,underline,foregroundColor"}})}
+ let r=await docs(e,"POST",`/documents/${id}:batchUpdate`,{requests:q});if(r._error)return out({built:false,documentId:id,url:url(id),stage:"text",error:r});
+ const labels=a.steps.map(s=>norm(s.leadin).trim().replace(/\.$/,"")),m=mermaid(labels),slot=P.find(p=>p.k==="img"),W0=a.diagramWidthPt||200;
+ const srcs=[`https://mermaid.ink/img/${b64u(m)}?type=png&bgColor=FFFFFF`,`https://kroki.io/mermaid/png/${await zlibB64u(m)}`];
+ let diagram={embedded:false,attempts:[]};
+ for(const src of srcs){const host=src.split("/")[2],dim=await pngDims(src);if(!dim){diagram.attempts.push({host,error:"image fetch failed"});continue}
+  const H=Math.round(W0*dim.h/dim.w*100)/100;
+  for(let t=0;t<2&&!diagram.embedded;t++){r=await docs(e,"POST",`/documents/${id}:batchUpdate`,{requests:[{insertInlineImage:{location:{index:slot.s},uri:src,objectSize:{width:{magnitude:W0,unit:"PT"},height:{magnitude:H,unit:"PT"}}}}]});
+   if(!r._error)diagram={embedded:true,host,widthPt:W0,heightPt:H,labels};else diagram.attempts.push({host,status:r.status})}
+  if(diagram.embedded)break}
+ if(a.folderId)await drive(e,"PATCH",`/files/${id}?addParents=${encodeURIComponent(a.folderId)}&fields=id`,{});
+ const sh=await perm(e,id);
+ const v=await docs(e,"GET",`/documents/${id}`),vr=v._error?{checks:{},passed:0,total:0,failed:["could not read doc back"]}:verifyDoc(v,a);
+ return out({built:true,documentId:id,title,url:url(id),shared:sh.ok,wordCount:chk.wordCount,warnings:chk.warnings,diagram,layout:`${vr.passed}/${vr.total}`,failed:vr.failed,checks:vr.checks})}
+function lintApplication(a){const raw=norm(a.application||""),parts=raw.split(/\n-{3,}\s*\n\s*Screening question answers[^\n]*\n/i);
+ const letter=parts[0].split("\n").filter(l=>!/^(Proposal doc|Hello video|Job post):/.test(l.trim())).join("\n").trim(),answers=(parts[1]||"").trim(),both=letter+"\n"+answers,E=[],Wn=[];
+ const lc=letter.length;if(lc>=5000)E.push(`letter is ${lc} chars, Upwork max is 5000`);else if(lc>3500)Wn.push(`letter is ${lc} chars, aim for 3500 or less`);
+ const idc=(both.match(/\bI'd\b/gi)||[]).length;if(idc)E.push(`${idc} "I'd"`);
+ const hr=(both.replace(/no hourly meter/gi,"").match(/\bhourly\b|\/\s?hr\b|per hour|\$\d+\s?\/\s?h\b/gi)||[]).length;if(hr)E.push(`${hr} hourly-rate mention(s)`);
+ const am=(both.match(/\[ADAM:/g)||[]).length;if(am>2)E.push(`${am} [ADAM] markers, max 2`);
+ const bio=letter.match(BIO_RE);if(!bio)E.push("bio is not intact (only the service may change; Unbounce sentence drops on GHL/ClickFunnels/Webflow)");
+ if(a.platform&&/ghl|clickfunnels|webflow/i.test(a.platform)&&/unbounce/i.test(both))E.push("Unbounce mentioned on a GHL/ClickFunnels/Webflow job");
+ const L=letter.split("\n");
+ if(a.gatePhrase){if(L[0].trim()!==String(a.gatePhrase).trim())E.push("gate phrase is not alone on line 1, verbatim")}
+ if(!/^(?:[^\n]+\n\s*\n)?Hi - I already built you a specific plan to /.test(letter))E.push('opener must be "Hi - I already built you a specific plan to ..."');
+ if(!letter.includes(FLAT_CLOSE))E.push("flat-fee close is missing or edited");
+ if(!/\n\s*Adam\s*$/.test(letter))E.push('letter must end with "Adam"');
+ if(/\[[^\]]+\]\(https?:[^)]*\)|\*\*/.test(letter))E.push("markdown in letter (Upwork prints it literally)");
+ const br=both.match(BRIT);if(br)E.push(`British spelling: ${[...new Set(br)].join(", ")}`);
+ const lk=both.match(LEAK);if(lk)E.push(`internal note in client-facing text: ${[...new Set(lk)].join(", ")}`);
+ const ac=answers?answers.split(/\n\s*\n/).filter(x=>x.trim()).length:0;
+ if(a.questionCount!=null&&ac!==a.questionCount)E.push(`${ac} answer paragraphs for ${a.questionCount} screening questions`);
+ return{pass:!E.length,errors:E,warnings:Wn,letterChars:lc,applicationChars:raw.length,idCount:idc,hourlyCount:hr,adamMarkers:am,bioService:bio?bio[1]:null,answerParagraphs:ac}}
+
 async function handle(e,n,a={}){let d,r;
  switch(n){
  case"doc_create":d=await docs(e,"POST","/documents",{title:a.title});if(d._error)return out(d);if(a.content)await docs(e,"POST",`/documents/${d.documentId}:batchUpdate`,{requests:[{insertText:{location:{index:1},text:a.content}}]});if(a.folderId)await drive(e,"PATCH",`/files/${d.documentId}?addParents=${encodeURIComponent(a.folderId)}&fields=id`,{});await perm(e,d.documentId);return out({documentId:d.documentId,title:a.title,url:url(d.documentId),shared:true});
@@ -61,6 +171,8 @@ async function handle(e,n,a={}){let d,r;
  case"doc_insert_table":r=await docs(e,"POST",`/documents/${a.documentId}:batchUpdate`,{requests:[{insertTable:{rows:a.rows,columns:a.columns,location:loc(a,a.index)}}]});return out({documentId:a.documentId,inserted:!r._error,response:r,url:url(a.documentId)});
  case"doc_insert_image":r=await docs(e,"POST",`/documents/${a.documentId}:batchUpdate`,{requests:[{insertInlineImage:{location:loc(a,a.index),uri:a.imageUrl,objectSize:{width:{magnitude:a.widthPt||300,unit:"PT"},height:{magnitude:a.heightPt||200,unit:"PT"}}}}]});return out({documentId:a.documentId,inserted:!r._error,response:r,url:url(a.documentId)});
  case"doc_share":r=await perm(e,a.documentId,a.role||"reader");return out({documentId:a.documentId,shared:r.ok,role:a.role||"reader",url:url(a.documentId)});
+ case"doc_build_proposal":return buildProposal(e,a);
+ case"doc_lint_application":return out(lintApplication(a));
  default:throw Error(`Unknown tool: ${n}`)}}
 function rpc(id,result){return{jsonrpc:"2.0",id,result}}function err(id,c,m){return{jsonrpc:"2.0",id,error:{code:c,message:m}}}
 async function route(e,q){const{method,params,id}=q;switch(method){case"initialize":return rpc(id,{protocolVersion:PROTOCOL_VERSION,capabilities:{tools:{listChanged:false}},serverInfo:SERVER_INFO});case"notifications/initialized":case"notifications/cancelled":return null;case"ping":return rpc(id,{});case"tools/list":return rpc(id,{tools:TOOLS});case"tools/call":try{return rpc(id,await handle(e,params?.name,params?.arguments))}catch(x){return rpc(id,{content:[{type:"text",text:`Error: ${x.message}`}],isError:true})}default:return err(id,-32601,`Method not found: ${method}`)}}
