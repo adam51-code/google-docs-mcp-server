@@ -1,4 +1,4 @@
-const SERVER_INFO={name:"google-docs-api",version:"1.6.0"};
+const SERVER_INFO={name:"google-docs-api",version:"1.6.1"};
 const PROTOCOL_VERSION="2024-11-05",TOKEN_URL="https://oauth2.googleapis.com/token",AUTH_URL="https://accounts.google.com/o/oauth2/v2/auth",KV_KEY="google_oauth_tokens";
 const SCOPES="https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive.file";
 async function getTokens(e){const x=await e.GOOGLE_TOKENS.get(KV_KEY);return x?JSON.parse(x):null}
@@ -113,7 +113,8 @@ async function buildProposal(e,a){const chk=proposalErrors(a);
  if(chk.errors.length)return out({built:false,errors:chk.errors,warnings:chk.warnings,wordCount:chk.wordCount,next:"Nothing was created. Fix every error in the content and call doc_build_proposal again."});
  const P=paras(a);let i=1;for(const p of P){p.s=i;i+=p.t.length+1}const text=P.map(p=>p.t).join("\n"),endI=1+text.length;
  const title=String(a.title).replace(/\s+/g," ").trim();
- const d=await docs(e,"POST","/documents",{title});if(d._error)return out({built:false,stage:"create",error:d});const id=d.documentId;
+ let id,discarded=0;for(let k=0;k<10;k++){const d=await docs(e,"POST","/documents",{title});if(d._error)return out({built:false,stage:"create",error:d,discarded});if(!String(d.documentId).includes("_")){id=d.documentId;break}const x=await drive(e,"DELETE",`/files/${d.documentId}`);if(x&&x._error)await drive(e,"PATCH",`/files/${d.documentId}`,{trashed:true});discarded++}
+ if(!id)return out({built:false,stage:"create",error:"10 tries and every doc ID had an underscore. Call again.",discarded});
  const q=[{insertText:{location:{index:1},text}},{updateParagraphStyle:{range:{startIndex:1,endIndex:endI},paragraphStyle:{lineSpacing:115},fields:"lineSpacing"}}];
  for(const p of P){if(p.k==="h")q.push({updateParagraphStyle:{range:{startIndex:p.s,endIndex:p.s+p.t.length+1},paragraphStyle:{namedStyleType:"HEADING_3"},fields:"namedStyleType"}});
   if(p.k==="step")q.push({updateTextStyle:{range:{startIndex:p.s+p.ls,endIndex:p.s+p.ls+p.ll},textStyle:{bold:true},fields:"bold"}})}
@@ -130,7 +131,7 @@ async function buildProposal(e,a){const chk=proposalErrors(a);
  if(a.folderId)await drive(e,"PATCH",`/files/${id}?addParents=${encodeURIComponent(a.folderId)}&fields=id`,{});
  const sh=await perm(e,id);
  const v=await docs(e,"GET",`/documents/${id}`),vr=v._error?{checks:{},passed:0,total:0,failed:["could not read doc back"]}:verifyDoc(v,a);
- return out({built:true,documentId:id,title,url:url(id),shared:sh.ok,wordCount:chk.wordCount,warnings:chk.warnings,diagram,layout:`${vr.passed}/${vr.total}`,failed:vr.failed,checks:vr.checks})}
+ return out({built:true,documentId:id,title,url:url(id),underscoreRetries:discarded,shared:sh.ok,wordCount:chk.wordCount,warnings:chk.warnings,diagram,layout:`${vr.passed}/${vr.total}`,failed:vr.failed,checks:vr.checks})}
 function lintApplication(a){const raw=norm(a.application||""),parts=raw.split(/\n-{3,}\s*\n\s*Screening question answers[^\n]*\n/i);
  const letter=parts[0].split("\n").filter(l=>!/^(Proposal doc|Hello video|Job post):/.test(l.trim())).join("\n").trim(),answers=(parts[1]||"").trim(),both=letter+"\n"+answers,E=[],Wn=[];
  const lc=letter.length;if(lc>=5000)E.push(`letter is ${lc} chars, Upwork max is 5000`);else if(lc>3500)Wn.push(`letter is ${lc} chars, aim for 3500 or less`);
